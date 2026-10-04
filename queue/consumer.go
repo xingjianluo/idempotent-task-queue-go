@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -134,16 +135,20 @@ func (g *ConsumerGroup) worker(id int) {
 
 func (g *ConsumerGroup) process(id int, d *Delivery) {
 	t := d.Task
+	replayCtx := ""
+	if t.ReplayCount > 0 {
+		replayCtx = fmt.Sprintf(" replays=%d replay_attempts=%d", t.ReplayCount, t.ReplayAttempts)
+	}
 
 	// 处理器负责业务副作用（建议用 q.RunIdempotent 包装以获得持久化的 at-most-once 保护）。
 	err := g.handler(context.Background(), t)
 	if err != nil {
 		class := ClassifyFailure(err)
-		log.Printf("[%s worker-%d] task=%s attempt=%d FAIL class=%s reason=%q",
-			g.name, id, t.ID, t.Attempts, class, err.Error())
+		log.Printf("[%s worker-%d] task=%s attempt=%d%s FAIL class=%s reason=%q",
+			g.name, id, t.ID, t.Attempts, replayCtx, class, err.Error())
 		if nerr := g.q.Nack(t.ID, d.Token, class, err.Error()); nerr != nil {
-			log.Printf("[%s worker-%d] task=%s attempt=%d nack rejected: %v",
-				g.name, id, t.ID, t.Attempts, nerr)
+			log.Printf("[%s worker-%d] task=%s attempt=%d%s nack rejected: %v",
+				g.name, id, t.ID, t.Attempts, replayCtx, nerr)
 		}
 		return
 	}
@@ -151,12 +156,12 @@ func (g *ConsumerGroup) process(id int, d *Delivery) {
 	if err := g.q.Ack(t.ID, d.Token); err != nil {
 		// 典型为停机/旧投递导致的迟到确认；任务会按租约重新投递。
 		// 若副作用使用 RunIdempotent 包装，重投时认领会跳过，不会重复生效。
-		log.Printf("[%s worker-%d] task=%s attempt=%d ack rejected: %v",
-			g.name, id, t.ID, t.Attempts, err)
+		log.Printf("[%s worker-%d] task=%s attempt=%d%s ack rejected: %v",
+			g.name, id, t.ID, t.Attempts, replayCtx, err)
 		return
 	}
-	log.Printf("[%s worker-%d] task=%s attempt=%d ACK ok side_effect_done=%v",
-		g.name, id, t.ID, t.Attempts, t.SideEffectDone)
+	log.Printf("[%s worker-%d] task=%s attempt=%d%s ACK ok side_effect_done=%v",
+		g.name, id, t.ID, t.Attempts, replayCtx, t.SideEffectDone)
 }
 
 func (g *ConsumerGroup) reaper() {

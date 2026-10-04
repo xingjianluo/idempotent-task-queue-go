@@ -16,6 +16,10 @@ type Config struct {
 	MaxAttempts       int           // 最大投递次数
 	Backoff           Backoff       // 重试退避策略
 	Now               func() time.Time
+
+	// 死信重放的容量与背压边界。0 表示不限制（与引入该能力前的行为保持兼容）。
+	MaxReplayBatchSize int // 单次 Replay 允许重放的任务数量上限（>0 生效）
+	MaxReplayTotal     int // 队列生命周期内累计允许重放的任务数量上限（>0 生效）
 }
 
 func (c *Config) withDefaults() {
@@ -96,6 +100,10 @@ func hashPayload(p []byte) string {
 func (q *Queue) Submit(id string, payload []byte) (*Task, error) {
 	if id == "" {
 		return nil, fmt.Errorf("queue: task id must not be empty")
+	}
+	if isReservedTaskID(id) {
+		return nil, &RejectError{Op: "submit", Reason: ReasonInvalidReplay, TaskID: id,
+			Message: "task id uses the reserved internal prefix"}
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -178,6 +186,10 @@ func (q *Queue) Fetch(ctx context.Context) (*Delivery, error) {
 func (q *Queue) deliverLocked(t *Task) (*Delivery, error) {
 	now := q.cfg.Now()
 	t.Attempts++
+	if t.ReplayCount > 0 {
+		// 重放轮次中发生的投递单独计数，与原始处理历史区分。
+		t.ReplayAttempts++
+	}
 	t.DeliveryToken++
 	t.Status = StatusInFlight
 	t.LeaseExpiresAt = now.Add(q.cfg.VisibilityTimeout)
@@ -185,6 +197,9 @@ func (q *Queue) deliverLocked(t *Task) (*Delivery, error) {
 	if err := q.persistLocked(); err != nil {
 		// 落盘失败则本次投递不生效，状态回滚为待投递。
 		t.Attempts--
+		if t.ReplayCount > 0 {
+			t.ReplayAttempts--
+		}
 		t.DeliveryToken--
 		t.Status = StatusPending
 		t.LeaseExpiresAt = time.Time{}
@@ -252,7 +267,17 @@ func (q *Queue) Nack(taskID string, token int64, class FailureClass, reason stri
 	return q.failLocked(t, class, reason)
 }
 
-// failLocked 应用失败判定：不可重试直接死信；可重试且投递次数超限死信，
+// attemptsThisRoundLocked 返回当前处理轮次已发生的投递次数：
+// 未重放过就是 Attempts；重放过则是“最近一次重放基线之后”的投递次数
+// （Attempts - AttemptsAtReplay），从而让重放获得独立的重试预算，又不绕过上限。
+func (q *Queue) attemptsThisRoundLocked(t *Task) int {
+	if t.ReplayCount == 0 {
+		return t.Attempts
+	}
+	return t.Attempts - t.AttemptsAtReplay
+}
+
+// failLocked 应用失败判定：不可重试直接死信；可重试且本轮投递次数超限死信，
 // 否则按退避重新置为 pending。调用方持锁，状态已通过 token 校验。
 func (q *Queue) failLocked(t *Task, class FailureClass, reason string) error {
 	now := q.cfg.Now()
@@ -264,15 +289,17 @@ func (q *Queue) failLocked(t *Task, class FailureClass, reason string) error {
 	if class == FailureNonRetryable {
 		t.Status = StatusDeadLettered
 		t.DLQReason = DLQReasonNonRetryable
+		t.DeadLetteredAt = now
 		return q.persistLocked()
 	}
-	if t.Attempts >= t.MaxAttempts {
+	if q.attemptsThisRoundLocked(t) >= t.MaxAttempts {
 		t.Status = StatusDeadLettered
 		t.DLQReason = DLQReasonMaxAttempts
+		t.DeadLetteredAt = now
 		return q.persistLocked()
 	}
 	t.Status = StatusPending
-	t.VisibleAt = now.Add(q.cfg.Backoff.Next(t.Attempts))
+	t.VisibleAt = now.Add(q.cfg.Backoff.Next(q.attemptsThisRoundLocked(t)))
 	return q.persistLocked()
 }
 
@@ -299,12 +326,13 @@ func (q *Queue) ReapExpired() int {
 		t.LastFailureReason = "visibility timeout: consumer interrupted without ack"
 		t.UpdatedAt = now
 		t.LeaseExpiresAt = time.Time{}
-		if t.Attempts >= t.MaxAttempts {
+		if q.attemptsThisRoundLocked(t) >= t.MaxAttempts {
 			t.Status = StatusDeadLettered
 			t.DLQReason = DLQReasonMaxAttempts
+			t.DeadLetteredAt = now
 		} else {
 			t.Status = StatusPending
-			t.VisibleAt = now.Add(q.cfg.Backoff.Next(t.Attempts))
+			t.VisibleAt = now.Add(q.cfg.Backoff.Next(q.attemptsThisRoundLocked(t)))
 		}
 		n++
 	}
@@ -320,7 +348,7 @@ func (q *Queue) Task(id string) (*Task, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	t, ok := q.tasks[id]
-	if !ok {
+	if !ok || isReservedTaskID(id) {
 		return nil, false
 	}
 	return t.Clone(), true
@@ -332,6 +360,9 @@ func (q *Queue) DeadLetters() []*Task {
 	defer q.mu.Unlock()
 	var out []*Task
 	for _, t := range q.tasks {
+		if isReservedTaskID(t.ID) {
+			continue
+		}
 		if t.Status == StatusDeadLettered {
 			out = append(out, t.Clone())
 		}
@@ -340,12 +371,15 @@ func (q *Queue) DeadLetters() []*Task {
 	return out
 }
 
-// Snapshot 返回全部任务快照（测试/诊断用）。
+// Snapshot 返回全部任务快照（测试/诊断用），不含内部记账标记。
 func (q *Queue) Snapshot() map[string]*Task {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	out := make(map[string]*Task, len(q.tasks))
 	for id, t := range q.tasks {
+		if isReservedTaskID(id) {
+			continue
+		}
 		out[id] = t.Clone()
 	}
 	return out

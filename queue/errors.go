@@ -9,14 +9,18 @@ import (
 type RejectReason string
 
 const (
-	ReasonDuplicateSubmission RejectReason = "duplicate_submission" // 重复提交：任务已存在且载荷一致
-	ReasonPayloadConflict     RejectReason = "payload_conflict"     // ID 相同但载荷不一致
-	ReasonQueueClosed         RejectReason = "queue_closed"         // 队列已关闭
-	ReasonAlreadyAcked        RejectReason = "already_acked"        // 任务已确认，重复确认
-	ReasonDeadLettered        RejectReason = "dead_lettered"        // 任务已进入死信
-	ReasonUnknownDelivery     RejectReason = "unknown_delivery"     // 确认了一个不存在的任务
-	ReasonStaleDelivery       RejectReason = "stale_delivery"       // 旧投递（已重投）的迟到确认
-	ReasonNotInFlight         RejectReason = "not_in_flight"        // 任务当前不在投递状态
+	ReasonDuplicateSubmission RejectReason = "duplicate_submission"   // 重复提交：任务已存在且载荷一致
+	ReasonPayloadConflict     RejectReason = "payload_conflict"       // ID 相同但载荷不一致
+	ReasonQueueClosed         RejectReason = "queue_closed"           // 队列已关闭
+	ReasonAlreadyAcked        RejectReason = "already_acked"          // 任务已确认，重复确认
+	ReasonDeadLettered        RejectReason = "dead_lettered"          // 任务已进入死信
+	ReasonUnknownDelivery     RejectReason = "unknown_delivery"       // 确认了一个不存在的任务
+	ReasonStaleDelivery       RejectReason = "stale_delivery"         // 旧投递（已重投）的迟到确认
+	ReasonNotInFlight         RejectReason = "not_in_flight"          // 任务当前不在投递状态
+	ReasonNotDeadLettered     RejectReason = "not_dead_lettered"      // 重放点名的任务不在死信中（处理中/已完成/不存在）
+	ReasonReplayBatchTooLarge RejectReason = "replay_batch_too_large" // 单次重放数量超过 MaxReplayBatchSize
+	ReasonReplayQuotaExceeded RejectReason = "replay_quota_exceeded"  // 累计重放数量超过 MaxReplayTotal
+	ReasonInvalidReplay       RejectReason = "invalid_replay"         // 重放请求非法（如缺少批次 ID）
 )
 
 // RejectError 携带可区分的拒绝原因，调用方可用 AsReject 精确判定。

@@ -15,6 +15,8 @@ type Config struct {
 	VisibilityTimeout time.Duration // 租约时长，超时未确认则重新投递
 	MaxAttempts       int           // 最大投递次数
 	Backoff           Backoff       // 重试退避策略
+	MaxReplayPerBatch int           // 单次重放允许的最大任务数；负数表示不限
+	MaxReplayTotal    int           // 累计允许重放的任务总数；负数表示不限
 	Now               func() time.Time
 }
 
@@ -28,6 +30,12 @@ func (c *Config) withDefaults() {
 	if c.Backoff == nil {
 		c.Backoff = ExponentialBackoff{Base: 10 * time.Millisecond, Multiplier: 2, Max: time.Second}
 	}
+	if c.MaxReplayPerBatch == 0 {
+		c.MaxReplayPerBatch = 100
+	}
+	if c.MaxReplayTotal == 0 {
+		c.MaxReplayTotal = 1000
+	}
 	if c.Now == nil {
 		c.Now = time.Now
 	}
@@ -39,34 +47,53 @@ type Queue struct {
 	cfg   Config
 	store Store
 
-	mu     sync.Mutex
-	tasks  map[string]*Task
-	closed bool
-	cond   *sync.Cond // 用于唤醒阻塞中的 Fetch
+	mu            sync.Mutex
+	tasks         map[string]*Task
+	replayBatches map[string]*ReplayBatch
+	replayedTotal int // 累计已重放任务数（容量背压判定用）
+	closed        bool
+	cond          *sync.Cond // 用于唤醒阻塞中的 Fetch
 }
 
 // New 创建队列。
 func New(cfg Config, store Store) *Queue {
 	cfg.withDefaults()
-	q := &Queue{cfg: cfg, store: store, tasks: map[string]*Task{}}
+	q := &Queue{cfg: cfg, store: store, tasks: map[string]*Task{}, replayBatches: map[string]*ReplayBatch{}}
 	q.cond = sync.NewCond(&q.mu)
 	return q
 }
 
 // Open 加载持久化状态；重启后 in_flight 任务视为租约待回收。
+// 存储支持 replayStore 扩展时一并恢复重放批次记录与累计重放计数。
 func (q *Queue) Open() error {
 	tasks, err := q.store.Load()
 	if err != nil {
 		return err
 	}
+	batches := map[string]*ReplayBatch{}
+	if rs, ok := q.store.(replayStore); ok {
+		if batches, err = rs.LoadReplay(); err != nil {
+			return err
+		}
+	}
+	total := 0
+	for _, b := range batches {
+		total += len(b.TaskIDs)
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.tasks = tasks
+	q.replayBatches = batches
+	q.replayedTotal = total
 	return nil
 }
 
 // persist 调用时须持有 q.mu。
+// 存储支持 replayStore 扩展时，任务与重放批次记录在同一份快照里原子落盘。
 func (q *Queue) persistLocked() error {
+	if rs, ok := q.store.(replayStore); ok {
+		return rs.SaveAllWithReplay(q.tasks, q.replayBatches)
+	}
 	return q.store.SaveAll(q.tasks)
 }
 
@@ -178,6 +205,7 @@ func (q *Queue) Fetch(ctx context.Context) (*Delivery, error) {
 func (q *Queue) deliverLocked(t *Task) (*Delivery, error) {
 	now := q.cfg.Now()
 	t.Attempts++
+	t.TotalDeliveries++
 	t.DeliveryToken++
 	t.Status = StatusInFlight
 	t.LeaseExpiresAt = now.Add(q.cfg.VisibilityTimeout)
@@ -185,6 +213,7 @@ func (q *Queue) deliverLocked(t *Task) (*Delivery, error) {
 	if err := q.persistLocked(); err != nil {
 		// 落盘失败则本次投递不生效，状态回滚为待投递。
 		t.Attempts--
+		t.TotalDeliveries--
 		t.DeliveryToken--
 		t.Status = StatusPending
 		t.LeaseExpiresAt = time.Time{}
@@ -264,11 +293,13 @@ func (q *Queue) failLocked(t *Task, class FailureClass, reason string) error {
 	if class == FailureNonRetryable {
 		t.Status = StatusDeadLettered
 		t.DLQReason = DLQReasonNonRetryable
+		t.DeadLetteredAt = now
 		return q.persistLocked()
 	}
 	if t.Attempts >= t.MaxAttempts {
 		t.Status = StatusDeadLettered
 		t.DLQReason = DLQReasonMaxAttempts
+		t.DeadLetteredAt = now
 		return q.persistLocked()
 	}
 	t.Status = StatusPending
@@ -302,6 +333,7 @@ func (q *Queue) ReapExpired() int {
 		if t.Attempts >= t.MaxAttempts {
 			t.Status = StatusDeadLettered
 			t.DLQReason = DLQReasonMaxAttempts
+			t.DeadLetteredAt = now
 		} else {
 			t.Status = StatusPending
 			t.VisibleAt = now.Add(q.cfg.Backoff.Next(t.Attempts))

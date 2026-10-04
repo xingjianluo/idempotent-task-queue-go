@@ -45,7 +45,11 @@ type Task struct {
 	LastFailureClass  FailureClass `json:"last_failure_class"`
 	LastFailureReason string       `json:"last_failure_reason"`
 	DLQReason         DLQReason    `json:"dlq_reason"`
-	SideEffectDone    bool         `json:"side_effect_done"` // 副作用是否已执行（幂等保护）
+	DeadLetteredAt    time.Time    `json:"dead_lettered_at"`  // 进入死信的时间（重放后清零）
+	ReplayCount       int          `json:"replay_count"`      // 被人工重放的次数
+	TotalDeliveries   int          `json:"total_deliveries"`  // 累计投递次数（跨重放周期，永不重置）
+	LastReplayBatch   string       `json:"last_replay_batch"` // 最近一次重放所属批次
+	SideEffectDone    bool         `json:"side_effect_done"`  // 副作用是否已执行（幂等保护）
 }
 
 // Clone 返回任务的深拷贝快照。
